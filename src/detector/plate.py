@@ -182,10 +182,12 @@ class PlateDetector:
             # HyperLPR3 v0.1.x API: LicensePlateCatcher()(frame)
             # 返回格式: [(plate_number, confidence, plate_type, [x1, y1, x2, y2]), ...]
             detections = self.model(frame)
-            logger.info(f"HyperLPR3 原始检测: {len(detections)} 个结果")
-
-            for i, det in enumerate(detections):
-                logger.info(f"  车牌[{i}]: 号牌={det[0]}, 置信度={det[1]:.3f}, 类型={det[2]}, bbox={det[3] if len(det) > 3 else 'N/A'}")
+            if detections:
+                logger.info(f"HyperLPR3 原始检测: {len(detections)} 个结果")
+                for i, det in enumerate(detections):
+                    logger.info(f"  车牌[{i}]: 号牌={det[0]}, 置信度={det[1]:.3f}, 类型={det[2]}, bbox={det[3] if len(det) > 3 else 'N/A'}")
+            else:
+                logger.debug(f"HyperLPR3 原始检测: 0 个结果")
 
             for det in detections:
                 plate_number = det[0]

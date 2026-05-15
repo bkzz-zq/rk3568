@@ -128,18 +128,15 @@ def main():
     last_texts = None
     last_vehicles = []           # 缓存 NPU 车辆检测结果（供车牌检测使用）
 
-    # 辅助函数：检测并还原坐标
+    # 辅助函数：检测并还原坐标（同时还原缓存的车辆坐标）
     def _detect_and_rescale(detector, frame, scale):
         results = detector.detect(frame)
         for r in results:
             r["bbox"] = [int(v / scale) for v in r["bbox"]]
-        return results
-
-    # 辅助函数：车辆检测并还原坐标
-    def _detect_vehicles_and_rescale(frame, scale):
-        results = person_detector.detect_vehicles(frame)
-        for r in results:
-            r["bbox"] = [int(v / scale) for v in r["bbox"]]
+        # 同时还原缓存的车辆检测坐标到原图
+        if detector is person_detector:
+            for v in person_detector._last_vehicles:
+                v["bbox"] = [int(v / scale) for v in v["bbox"]]
         return results
 
     try:
@@ -174,33 +171,19 @@ def main():
                 # 按需提交检测任务
                 futures = {}
 
-                # NPU 车辆辅助检测（与行人检测共用同一模型，零额外开销）
-                if VEHICLE_ASSIST and person_detector is not None and need_plate_detect:
-                    # 在车牌检测帧上，同时用 NPU 检测车辆
-                    vehicle_future = detector_executor.submit(
-                        _detect_vehicles_and_rescale, small_frame, DETECT_SCALE
-                    )
-
-                # 行人检测用缩小帧（NPU 处理，速度快）
+                # 行人检测（NPU 模式下同时缓存车辆结果）
                 if person_detector is not None and need_person_detect:
                     futures[detector_executor.submit(
                         _detect_and_rescale, person_detector, small_frame, DETECT_SCALE
                     )] = "person"
 
-                # 车牌检测：优先使用 NPU 车辆区域缩小搜索范围
+                # 车牌检测：使用行人检测时缓存的车辆区域
                 if plate_detector is not None and need_plate_detect:
-                    # 获取 NPU 车辆检测结果
+                    # 从行人检测中获取缓存的车辆结果（一次 NPU 推理，零额外开销）
                     vehicle_regions = None
-                    if VEHICLE_ASSIST and person_detector is not None:
-                        try:
-                            vehicle_regions_raw = vehicle_future.result(timeout=2.0)
-                            if vehicle_regions_raw:
-                                # 坐标已还原到原图
-                                last_vehicles = vehicle_regions_raw
-                                vehicle_regions = vehicle_regions_raw
-                                logger.debug(f"NPU 辅助: 检测到 {len(vehicle_regions)} 辆车，缩小车牌搜索范围")
-                        except Exception as e:
-                            logger.debug(f"车辆检测结果获取失败: {e}")
+                    if VEHICLE_ASSIST and person_detector is not None and person_detector.last_vehicles:
+                        vehicle_regions = person_detector.last_vehicles
+                        logger.info(f"NPU 辅助: 检测到 {len(vehicle_regions)} 辆车，缩小车牌搜索范围")
 
                     futures[detector_executor.submit(
                         plate_detector.detect, frame, vehicle_regions
