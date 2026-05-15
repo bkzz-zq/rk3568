@@ -1,25 +1,100 @@
-"""车牌识别模块"""
+"""车牌识别模块 - NPU 检测加速版"""
 
 import time
+import copy
 import numpy as np
 import cv2
 from src.utils.logger import setup_logger
 
 logger = setup_logger("plate_detector")
 
+# HyperLPR3 车牌字符集（78 字符，与 rpv3_mdict_160_r3.onnx 对应）
+# 来源: hyperlpr3/common/tokenize.py
+PLATE_CHARS = [
+    # CTC blank (index 0), 省份 (1-31), 字母 (32-57), 数字 (58-67), 特殊 (68-77)
+    "京", "沪", "津", "渝", "冀", "晋", "蒙", "辽", "吉", "黑",
+    "苏", "浙", "皖", "闽", "赣", "鲁", "豫", "鄂", "湘", "粤",
+    "桂", "琼", "川", "贵", "云", "藏", "陕", "甘", "青", "宁",
+    "新",
+    "A", "B", "C", "D", "E", "F", "G", "H", "J", "K",
+    "L", "M", "N", "P", "Q", "R", "S", "T", "U", "V",
+    "W", "X", "Y", "Z",
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "警", "学", "挂", "港", "澳", "领", "使", "临", "电",
+]
+
+# 颜色分类: 0=蓝, 1=黄, 2=白
+PLATE_COLOR_MAP = {0: "蓝", 1: "黄", 2: "白"}
+
+
+def letter_box(img, size=(640, 640)):
+    """HyperLPR3 风格的 letterbox（与模型预处理一致）"""
+    h, w, c = img.shape
+    r = min(size[0] / h, size[1] / w)
+    new_h, new_w = int(h * r), int(w * r)
+    top = int((size[0] - new_h) / 2)
+    left = int((size[1] - new_w) / 2)
+    bottom = size[0] - new_h - top
+    right = size[1] - new_w - left
+    img_resize = cv2.resize(img, (new_w, new_h))
+    img = cv2.copyMakeBorder(img_resize, top, bottom, left, right,
+                             borderType=cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    return img, r, left, top
+
+
+def xywh2xyxy(boxes):
+    """xywh → xyxy"""
+    xyxy = copy.deepcopy(boxes)
+    xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+    xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+    xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+    xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+    return xyxy
+
+
+def nms(boxes, iou_thresh):
+    """非极大值抑制"""
+    if len(boxes) == 0:
+        return []
+    index = np.argsort(boxes[:, 4])[::-1]
+    keep = []
+    while index.size > 0:
+        i = index[0]
+        keep.append(i)
+        x1 = np.maximum(boxes[i, 0], boxes[index[1:], 0])
+        y1 = np.maximum(boxes[i, 1], boxes[index[1:], 1])
+        x2 = np.minimum(boxes[i, 2], boxes[index[1:], 2])
+        y2 = np.minimum(boxes[i, 3], boxes[index[1:], 3])
+        w = np.maximum(0, x2 - x1)
+        h = np.maximum(0, y2 - y1)
+        inter_area = w * h
+        union_area = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1]) + \
+                     (boxes[index[1:], 2] - boxes[index[1:], 0]) * (boxes[index[1:], 3] - boxes[index[1:], 1])
+        iou = inter_area / (union_area - inter_area + 1e-6)
+        idx = np.where(iou <= iou_thresh)[0]
+        index = index[idx + 1]
+    return keep
+
 
 class PlateDetector:
-    """车牌检测与识别器"""
+    """车牌检测与识别器（NPU 加速版）"""
 
     def __init__(self, config: dict, npu_enabled: bool = False):
         self.config = config
         self.npu_enabled = npu_enabled
         self.confidence = config.get("confidence", 0.5)
-        self.model = None
-        self.ocr = None
-        self._backend = None
+        self.box_threshold = config.get("box_threshold", 0.3)
+        self.nms_threshold = config.get("nms_threshold", 0.5)
 
-        # ROI 感兴趣区域 [x1, y1, x2, y2] 归一化坐标 (0~1)
+        # 模型句柄
+        self.det_model = None      # RKNN 检测模型 (NPU)
+        self.rec_session = None    # ONNX 识别模型 (CPU)
+        self.cls_session = None    # ONNX 颜色分类模型 (CPU)
+        self.model = None          # HyperLPR3 后备
+        self.ocr = None            # PaddleOCR 后备
+        self._backend = None       # "npu" / "hyperlpr3" / "paddleocr"
+
+        # ROI 感兴趣区域
         self.roi = config.get("roi", None)
         if self.roi:
             logger.info(f"车牌检测 ROI 区域: {self.roi}")
@@ -28,37 +103,73 @@ class PlateDetector:
 
     def load_model(self) -> bool:
         """加载车牌检测和识别模型"""
+        # 优先尝试 NPU 模式
+        if self.npu_enabled:
+            if self._load_npu_models():
+                self._backend = "npu"
+                return True
+            logger.warning("NPU 模型加载失败，回退到 HyperLPR3")
+
+        # 回退到 HyperLPR3
         try:
-            # 尝试使用 HyperLPR3
-            try:
-                from hyperlpr3 import LicensePlateCatcher
+            from hyperlpr3 import LicensePlateCatcher
+            self.model = LicensePlateCatcher()
+            self._backend = "hyperlpr3"
+            logger.info("HyperLPR3 车牌识别模型加载成功（后备模式）")
+            return True
+        except ImportError:
+            logger.warning("HyperLPR3 未安装")
+        except Exception as e:
+            logger.warning(f"HyperLPR3 加载失败: {e}")
 
-                self.model = LicensePlateCatcher()
-                self._backend = "hyperlpr3"
-                logger.info("HyperLPR3 车牌识别模型加载成功")
-                return True
-            except ImportError:
-                logger.warning("HyperLPR3 未安装，尝试使用 PaddleOCR")
-            except Exception as e:
-                logger.warning(f"HyperLPR3 加载失败: {e}，尝试使用 PaddleOCR")
+        # 回退到 PaddleOCR
+        try:
+            from paddleocr import PaddleOCR
+            self.ocr = PaddleOCR(use_angle_cls=True, lang="ch")
+            self._backend = "paddleocr"
+            logger.info("PaddleOCR 车牌识别模型加载成功")
+            return True
+        except ImportError:
+            logger.error("PaddleOCR 也未安装，车牌识别功能不可用")
+            return False
 
-            # 回退到 PaddleOCR
-            try:
-                from paddleocr import PaddleOCR
+    def _load_npu_models(self) -> bool:
+        """加载 NPU 检测模型 + CPU 识别模型"""
+        try:
+            import onnxruntime as ort
 
-                self.ocr = PaddleOCR(
-                    use_angle_cls=True,
-                    lang="ch",
-                )
-                self._backend = "paddleocr"
-                logger.info("PaddleOCR 车牌识别模型加载成功")
-                return True
-            except ImportError:
-                logger.error("PaddleOCR 也未安装，车牌识别功能不可用")
+            # 1. 加载 RKNN 检测模型
+            from rknnlite.api import RKNNLite
+            det_model_path = self.config.get("det_model_path", "models/plate_detect_640.rknn")
+            self.det_model = RKNNLite()
+            ret = self.det_model.load_rknn(det_model_path)
+            if ret != 0:
+                logger.error(f"加载 RKNN 车牌检测模型失败: {det_model_path}")
                 return False
+            ret = self.det_model.init_runtime(target=None)
+            if ret != 0:
+                logger.error("初始化 RKNN 车牌检测运行时失败")
+                return False
+            logger.info(f"RKNN 车牌检测模型加载成功: {det_model_path}")
+
+            # 2. 加载 ONNX 识别模型
+            rec_model_path = self.config.get("rec_model_path", "models/rpv3_mdict_160_r3.onnx")
+            self.rec_session = ort.InferenceSession(rec_model_path, providers=['CPUExecutionProvider'])
+            logger.info(f"ONNX 车牌识别模型加载成功: {rec_model_path}")
+
+            # 3. 加载 ONNX 颜色分类模型
+            cls_model_path = self.config.get("cls_model_path", "models/litemodel_cls_96x_r1.onnx")
+            self.cls_session = ort.InferenceSession(cls_model_path, providers=['CPUExecutionProvider'])
+            logger.info(f"ONNX 车牌颜色分类模型加载成功: {cls_model_path}")
+
+            logger.info("✓ NPU 车牌检测加速模式就绪")
+            return True
 
         except Exception as e:
-            logger.error(f"加载车牌识别模型失败: {e}")
+            logger.error(f"NPU 模型加载失败: {e}")
+            self.det_model = None
+            self.rec_session = None
+            self.cls_session = None
             return False
 
     def detect(self, frame: np.ndarray, vehicle_regions: list = None) -> list:
@@ -67,147 +178,233 @@ class PlateDetector:
 
         Args:
             frame: BGR 图像
-            vehicle_regions: NPU 检测到的车辆区域 [{"bbox": [x1,y1,x2,y2], ...}, ...]
-                            如果提供，只在车辆区域内搜索车牌（大幅加速）
+            vehicle_regions: 车辆区域（保留接口兼容）
 
         Returns:
-            检测结果列表: [{"bbox": [x1,y1,x2,y2], "confidence": float, "label": "plate", "plate_number": "京A12345", "plate_color": "蓝"}]
+            [{"bbox": [x1,y1,x2,y2], "confidence": float, "label": "plate",
+              "plate_number": "湘AU5555", "plate_color": "蓝"}]
         """
-        if self.model is None and self.ocr is None:
+        if self._backend is None:
             return []
 
         start_time = time.time()
 
-        # 如果有车辆区域，只在车辆区域内检测车牌（大幅缩小搜索范围）
-        if vehicle_regions and len(vehicle_regions) > 0:
-            results = self._detect_in_vehicles(frame, vehicle_regions)
+        if self._backend == "npu":
+            results = self._detect_npu(frame)
+        elif self._backend == "hyperlpr3":
+            results = self._detect_hyperlpr3(frame)
         else:
-            # 回退到 ROI 全区域检测
             roi_frame, roi_offset = self._crop_roi(frame)
-
-            if self._backend == "hyperlpr3":
-                results = self._detect_hyperlpr3(roi_frame)
-            else:
-                results = self._detect_paddleocr(roi_frame)
-
+            results = self._detect_paddleocr(roi_frame)
             if roi_offset:
                 for r in results:
                     r["bbox"] = [r["bbox"][0] + roi_offset[0], r["bbox"][1] + roi_offset[1],
-                                  r["bbox"][2] + roi_offset[0], r["bbox"][3] + roi_offset[1]]
+                                 r["bbox"][2] + roi_offset[0], r["bbox"][3] + roi_offset[1]]
 
         elapsed = (time.time() - start_time) * 1000
-        logger.info(f"车牌识别耗时: {elapsed:.1f}ms, 识别到 {len(results)} 个车牌"
-                     f"{' (车辆辅助)' if vehicle_regions else ''}")
+        logger.info(f"车牌识别耗时: {elapsed:.1f}ms, 识别到 {len(results)} 个车牌 [{self._backend}]")
 
         return results
 
-    def _detect_in_vehicles(self, frame: np.ndarray, vehicles: list) -> list:
-        """在 NPU 检测到的车辆区域内搜索车牌（核心优化）"""
-        all_results = []
-        h, w = frame.shape[:2]
+    # ==================== NPU 加速模式 ====================
 
-        for vehicle in vehicles:
-            vx1, vy1, vx2, vy2 = vehicle["bbox"]
+    def _detect_npu(self, frame: np.ndarray) -> list:
+        """NPU 检测 + CPU 识别 全流程"""
+        # 1. 裁剪 ROI
+        roi_frame, roi_offset = self._crop_roi(frame)
 
-            # 车牌一般在车辆下半部分，聚焦该区域
-            vehicle_h = vy2 - vy1
-            vehicle_w = vx2 - vx1
+        # 2. NPU 检测车牌区域
+        detections = self._detect_plate_rknn(roi_frame)
+        if not detections:
+            return []
 
-            # 只取车辆下半部分（车牌位置），加一些余量
-            plate_y1 = max(0, vy1 + int(vehicle_h * 0.4))
-            plate_y2 = min(h, vy2 + int(vehicle_h * 0.1))
-            plate_x1 = max(0, vx1 - int(vehicle_w * 0.05))
-            plate_x2 = min(w, vx2 + int(vehicle_w * 0.05))
+        # 3. 坐标映射回原图
+        if roi_offset:
+            for det in detections:
+                det["bbox"] = [det["bbox"][0] + roi_offset[0], det["bbox"][1] + roi_offset[1],
+                               det["bbox"][2] + roi_offset[0], det["bbox"][3] + roi_offset[1]]
 
-            crop = frame[plate_y1:plate_y2, plate_x1:plate_x2]
-            if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 20:
+        # 4. 对每个检测到的车牌做识别
+        results = []
+        for det in detections:
+            x1, y1, x2, y2 = det["bbox"]
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 10:
                 continue
 
-            # 在裁剪区域内检测车牌
-            if self._backend == "hyperlpr3":
-                detections = self._detect_hyperlpr3(crop)
-            else:
-                detections = self._detect_paddleocr(crop)
+            # 识别车牌号
+            plate_number = self._recognize_plate(crop)
+            if not plate_number:
+                continue
 
-            # 将坐标映射回原图
-            for r in detections:
-                r["bbox"] = [r["bbox"][0] + plate_x1, r["bbox"][1] + plate_y1,
-                              r["bbox"][2] + plate_x1, r["bbox"][3] + plate_y1]
-                all_results.append(r)
+            # 识别颜色
+            plate_color = self._classify_color(crop)
 
-        # 如果车辆区域都没检测到，回退到 ROI 全区域检测（兜底）
-        if not all_results:
-            roi_frame, roi_offset = self._crop_roi(frame)
-            if self._backend == "hyperlpr3":
-                all_results = self._detect_hyperlpr3(roi_frame)
-            else:
-                all_results = self._detect_paddleocr(roi_frame)
-            if roi_offset:
-                for r in all_results:
-                    r["bbox"] = [r["bbox"][0] + roi_offset[0], r["bbox"][1] + roi_offset[1],
-                                  r["bbox"][2] + roi_offset[0], r["bbox"][3] + roi_offset[1]]
+            results.append({
+                "bbox": [x1, y1, x2, y2],
+                "confidence": det["confidence"],
+                "label": "plate",
+                "plate_number": plate_number,
+                "plate_color": plate_color,
+            })
 
-        return all_results
+        return results
 
-    def _crop_roi(self, frame: np.ndarray) -> tuple:
-        """
-        裁剪 ROI 感兴趣区域
+    def _detect_plate_rknn(self, frame: np.ndarray) -> list:
+        """使用 RKNN NPU 进行车牌检测"""
+        try:
+            h, w = frame.shape[:2]
+            det_start = time.time()
 
-        Returns:
-            (roi_frame, offset): 裁剪后的图像和偏移量 (x_off, y_off)
-        """
-        if not self.roi or len(self.roi) != 4:
-            return frame, None
+            # 预处理: letterbox 640x640 → BGR 转 RGB → NHWC uint8
+            img_u8, r, left, top = letter_box(frame, (640, 640))
+            img_u8 = cv2.cvtColor(img_u8, cv2.COLOR_BGR2RGB)
+            img_u8 = np.expand_dims(img_u8, 0).astype(np.uint8)
 
-        h, w = frame.shape[:2]
-        x1 = int(self.roi[0] * w)
-        y1 = int(self.roi[1] * h)
-        x2 = int(self.roi[2] * w)
-        y2 = int(self.roi[3] * h)
+            outputs = self.det_model.inference(inputs=[img_u8])
+            dets = outputs[0]  # (1, 25200, 15)
+            if len(dets.shape) == 3:
+                dets = dets[0]  # (25200, 15)
 
-        # 边界检查
-        x1 = max(0, min(x1, w - 1))
-        y1 = max(0, min(y1, h - 1))
-        x2 = max(0, min(x2, w))
-        y2 = max(0, min(y2, h))
+            # 后处理 (与 HyperLPR3 multitask_detect.py 一致)
+            # 过滤低置信度
+            choice = dets[:, 4] > self.box_threshold
+            dets = dets[choice]
 
-        roi_frame = frame[y1:y2, x1:x2]
-        return roi_frame, (x1, y1)
+            if len(dets) == 0:
+                return []
+
+            # 类别分数 = objectness × class_score
+            dets[:, 13:15] *= dets[:, 4:5]
+            box = dets[:, :4]
+            boxes = xywh2xyxy(box)
+            score = np.max(dets[:, 13:15], axis=-1, keepdims=True)
+
+            # 组合: [x1,y1,x2,y2, score, ...corners, class_idx]
+            output = np.concatenate((boxes, score, dets[:, 5:13]), axis=1)
+
+            # NMS
+            reserve = nms(output, self.nms_threshold)
+            output = output[reserve]
+
+            # 坐标还原
+            output[:, [0, 2, 5, 7, 9, 11]] -= left
+            output[:, [1, 3, 6, 8, 10, 12]] -= top
+            output[:, [0, 2, 5, 7, 9, 11]] /= r
+            output[:, [1, 3, 6, 8, 10, 12]] /= r
+
+            # 转为结果列表
+            results = []
+            for row in output:
+                x1 = max(0, int(row[0]))
+                y1 = max(0, int(row[1]))
+                x2 = min(w, int(row[2]))
+                y2 = min(h, int(row[3]))
+                conf = float(row[4])
+
+                if conf < self.confidence:
+                    continue
+                if (x2 - x1) < 10 or (y2 - y1) < 5:
+                    continue
+
+                results.append({
+                    "bbox": [x1, y1, x2, y2],
+                    "confidence": round(conf, 3),
+                })
+
+            det_ms = (time.time() - det_start) * 1000
+            if results:
+                logger.info(f"NPU 车牌检测: {len(results)} 个, 耗时: {det_ms:.0f}ms")
+
+            return results
+
+        except Exception as e:
+            logger.error(f"NPU 车牌检测失败: {e}")
+            return []
+
+    def _recognize_plate(self, crop: np.ndarray) -> str:
+        """使用 ONNX 识别模型识别车牌号"""
+        try:
+            # 预处理: 缩放到 160x48, BGR→RGB, 归一化
+            img = cv2.resize(crop, (160, 48))
+            img = img[:, :, ::-1].transpose(2, 0, 1).copy().astype(np.float32)
+            img = img / 255.0
+            img = img.reshape(1, *img.shape)
+
+            # 推理
+            input_name = self.rec_session.get_inputs()[0].name
+            output = self.rec_session.run(None, {input_name: img})[0]  # (1, 20, 78)
+
+            # CTC 解码
+            plate = self._ctc_decode(output[0])
+            return plate
+
+        except Exception as e:
+            logger.debug(f"车牌识别失败: {e}")
+            return ""
+
+    def _ctc_decode(self, pred: np.ndarray) -> str:
+        """CTC 解码: pred shape (20, 78) → 车牌号字符串"""
+        chars = []
+        prev_idx = -1
+        for t in range(pred.shape[0]):
+            idx = np.argmax(pred[t])
+            if idx != 0 and idx != prev_idx:  # 0 = CTC blank
+                if idx < len(PLATE_CHARS):
+                    chars.append(PLATE_CHARS[idx - 1])  # chars 从 index 1 开始
+            prev_idx = idx
+
+        plate = "".join(chars)
+        return plate
+
+    def _classify_color(self, crop: np.ndarray) -> str:
+        """使用 ONNX 分类模型识别车牌颜色"""
+        try:
+            img = cv2.resize(crop, (96, 96))
+            img = img[:, :, ::-1].transpose(2, 0, 1).copy().astype(np.float32)
+            img = img / 255.0
+            img = img.reshape(1, *img.shape)
+
+            input_name = self.cls_session.get_inputs()[0].name
+            output = self.cls_session.run(None, {input_name: img})[0]  # (1, 3)
+            color_idx = np.argmax(output[0])
+            return PLATE_COLOR_MAP.get(int(color_idx), "未知")
+
+        except Exception as e:
+            logger.debug(f"车牌颜色分类失败: {e}")
+            return "未知"
+
+    # ==================== HyperLPR3 后备模式 ====================
 
     def _detect_hyperlpr3(self, frame: np.ndarray) -> list:
-        """使用 HyperLPR3 进行车牌识别（含裁剪放大重识别）"""
+        """使用 HyperLPR3 端到端识别"""
         results = []
         try:
-            # 第一次检测：全图检测
-            # HyperLPR3 v0.1.x API: LicensePlateCatcher()(frame)
-            # 返回格式: [(plate_number, confidence, plate_type, [x1, y1, x2, y2]), ...]
-            detections = self.model(frame)
+            roi_frame, roi_offset = self._crop_roi(frame)
+            detections = self.model(roi_frame)
             if detections:
                 logger.info(f"HyperLPR3 原始检测: {len(detections)} 个结果")
-                for i, det in enumerate(detections):
-                    logger.info(f"  车牌[{i}]: 号牌={det[0]}, 置信度={det[1]:.3f}, 类型={det[2]}, bbox={det[3] if len(det) > 3 else 'N/A'}")
             else:
-                logger.debug(f"HyperLPR3 原始检测: 0 个结果")
+                logger.debug("HyperLPR3 原始检测: 0 个结果")
 
             for det in detections:
                 plate_number = det[0]
                 confidence = float(det[1])
-                plate_type = det[2]  # 0: 蓝牌, 1: 黄牌, 2: 白牌, 3: 绿牌
+                plate_type = det[2]
                 bbox = det[3] if len(det) > 3 else [0, 0, 0, 0]
-
                 plate_color_map = {0: "蓝", 1: "黄", 2: "白", 3: "绿", 4: "黑"}
 
                 x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
 
-                # 注：裁剪放大重识别已禁用（耗时 300-600ms，严重影响帧率）
-                # 如需启用，取消下方注释
-                # if confidence < 0.9 and (x2 - x1) > 10 and (y2 - y1) > 5:
-                #     refined = self._refine_plate(frame, x1, y1, x2, y2)
-                #     if refined is not None and refined["confidence"] > confidence:
-                #         plate_number = refined["plate_number"]
-                #         confidence = refined["confidence"]
-                #         plate_type = refined["plate_type"]
-                #         x1, y1, x2, y2 = refined["bbox"]
+                if roi_offset:
+                    x1 += roi_offset[0]
+                    y1 += roi_offset[1]
+                    x2 += roi_offset[0]
+                    y2 += roi_offset[1]
 
                 if confidence < self.confidence:
                     continue
@@ -225,65 +422,13 @@ class PlateDetector:
 
         return results
 
-    def _refine_plate(self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> dict:
-        """裁剪车牌区域放大后重新识别，提高准确率"""
-        try:
-            h, w = frame.shape[:2]
-
-            # 扩大裁剪区域（包含一些背景，帮助检测）
-            pad_x = max(10, int((x2 - x1) * 0.3))
-            pad_y = max(5, int((y2 - y1) * 0.3))
-            cx1 = max(0, x1 - pad_x)
-            cy1 = max(0, y1 - pad_y)
-            cx2 = min(w, x2 + pad_x)
-            cy2 = min(h, y2 + pad_y)
-
-            # 裁剪车牌区域
-            crop = frame[cy1:cy2, cx1:cx2]
-            if crop.size == 0:
-                return None
-
-            # 放大到至少 320 像素宽（提高识别精度）
-            crop_h, crop_w = crop.shape[:2]
-            scale = max(2.0, 320 / crop_w)
-            if scale > 1.5:
-                crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-
-            # 在放大后的裁剪区域重新识别
-            redetect = self.model(crop)
-            if not redetect:
-                return None
-
-            # 取置信度最高的结果
-            best = max(redetect, key=lambda d: float(d[1]))
-            plate_number = best[0]
-            confidence = float(best[1])
-            plate_type = best[2]
-            rbbox = best[3] if len(best) > 3 else [0, 0, 0, 0]
-
-            # 将裁剪区域的坐标映射回原图
-            rx1 = int(rbbox[0] / scale) + cx1
-            ry1 = int(rbbox[1] / scale) + cy1
-            rx2 = int(rbbox[2] / scale) + cx1
-            ry2 = int(rbbox[3] / scale) + cy1
-
-            return {
-                "plate_number": plate_number,
-                "confidence": confidence,
-                "plate_type": plate_type,
-                "bbox": [rx1, ry1, rx2, ry2],
-            }
-
-        except Exception as e:
-            logger.debug(f"车牌裁剪重识别失败: {e}")
-            return None
+    # ==================== PaddleOCR 后备模式 ====================
 
     def _detect_paddleocr(self, frame: np.ndarray) -> list:
         """使用 PaddleOCR 进行车牌识别"""
         results = []
         try:
             ocr_results = self.ocr.ocr(frame, cls=True)
-
             if ocr_results is None or len(ocr_results) == 0:
                 return results
 
@@ -291,21 +436,17 @@ class PlateDetector:
                 if line is None:
                     continue
                 for item in line:
-                    bbox_points = item[0]
                     text = item[1][0]
                     confidence = float(item[1][1])
 
                     if confidence < self.confidence:
                         continue
-
                     if self._is_plate_like(text):
+                        bbox_points = item[0]
                         xs = [p[0] for p in bbox_points]
                         ys = [p[1] for p in bbox_points]
-                        x1, y1 = int(min(xs)), int(min(ys))
-                        x2, y2 = int(max(xs)), int(max(ys))
-
                         results.append({
-                            "bbox": [x1, y1, x2, y2],
+                            "bbox": [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))],
                             "confidence": round(confidence, 3),
                             "label": "plate",
                             "plate_number": text,
@@ -317,26 +458,38 @@ class PlateDetector:
 
         return results
 
+    # ==================== 工具方法 ====================
+
+    def _crop_roi(self, frame: np.ndarray) -> tuple:
+        """裁剪 ROI 感兴趣区域"""
+        if not self.roi or len(self.roi) != 4:
+            return frame, None
+
+        h, w = frame.shape[:2]
+        x1 = max(0, min(int(self.roi[0] * w), w - 1))
+        y1 = max(0, min(int(self.roi[1] * h), h - 1))
+        x2 = max(0, min(int(self.roi[2] * w), w))
+        y2 = max(0, min(int(self.roi[3] * h), h))
+
+        return frame[y1:y2, x1:x2], (x1, y1)
+
     @staticmethod
     def _is_plate_like(text: str) -> bool:
         """判断文本是否像车牌号"""
         if not text or len(text) < 7:
             return False
-
         clean = text.replace(" ", "").replace(".", "").replace("·", "")
-
-        if len(clean) == 8:
-            if clean[0] and clean[1].isalpha():
-                return True
-
-        if len(clean) == 7:
-            if clean[0] and clean[1].isalpha():
-                return True
-
+        if len(clean) in (7, 8) and clean[1].isalpha():
+            return True
         return False
 
     def release(self):
         """释放模型资源"""
+        if self.det_model is not None:
+            self.det_model.release()
+            self.det_model = None
+        self.rec_session = None
+        self.cls_session = None
         self.model = None
         self.ocr = None
         logger.info("车牌检测器已释放")

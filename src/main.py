@@ -106,7 +106,7 @@ def main():
     # 检测优化参数
     DETECT_WIDTH = 640           # 检测时缩放到的宽度
     DETECT_INTERVAL = 3          # 行人检测：每隔几帧做一次检测
-    PLATE_DETECT_INTERVAL = 9    # 车牌检测：每隔几帧做一次（CPU密集，降低频率）
+    PLATE_DETECT_INTERVAL = 6    # 车牌检测：每隔几帧做一次（NPU加速后可降低间隔）
     DETECT_SCALE = None          # 缓存缩放比例
     VEHICLE_ASSIST = True        # NPU 车辆辅助车牌检测（零成本优化）
 
