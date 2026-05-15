@@ -1,0 +1,81 @@
+# RK3568 智能视觉识别系统 配置文件
+
+# 海康威视摄像头配置
+camera:
+  # RTSP 主码流（高清）
+  main_stream: "rtsp://admin:sdxyp123@192.168.0.66:554/Streaming/Channels/101"
+  # RTSP 子码流（标清，用于检测，降低计算量）
+  sub_stream: "rtsp://admin:sdxyp123@192.168.0.66:554/Streaming/Channels/201"
+  # 使用的码流: "main" 或 "sub"
+  use_stream: "sub"
+  # 帧率限制（0=不限制）
+  fps_limit: 15
+  # 重新连接间隔（秒）
+  reconnect_interval: 5
+
+# 行人检测配置
+person_detection:
+  enabled: true
+  # 置信度阈值
+  confidence: 0.5
+  # NMS 阈值
+  nms_threshold: 0.4
+  # 模型路径（RKNN 模型或 ONNX 模型）
+  model_path: "models/yolov8n.rknn"
+  # 备用 ONNX 模型（PC 调试用）
+  onnx_model_path: "models/yolov8n.onnx"
+
+# 车牌识别配置
+plate_recognition:
+  enabled: true
+  # 车牌检测置信度
+  confidence: 0.5
+  # 模型路径
+  model_path: "models/plate_detect.rknn"
+  # 感兴趣区域 ROI [x1, y1, x2, y2] 归一化坐标 (0.0~1.0)
+  # 只检测这个区域内的车牌，提高检测速度和准确率
+  # [左边, 上边, 右边, 下边]，例如 [0.1, 0.4, 0.9, 0.95] 表示画面下半部分
+  roi: [0.1, 0.4, 0.9, 0.95]
+
+# 文字识别配置 (PaddleOCR)
+ocr:
+  enabled: true
+  # 检测置信度
+  det_threshold: 0.5
+  # 识别置信度
+  rec_threshold: 0.5
+  # 语言
+  lang: "ch"
+  # 使用角度分类
+  use_angle_cls: true
+
+# RKNN NPU 配置
+npu:
+  # 是否启用 NPU 加速（false 则使用 CPU）
+  enabled: true
+  # RKNN 目标平台
+  target: "rk3568"
+
+# WebSocket 推送配置
+websocket:
+  # 推送地址（PC 端地址）
+  host: "0.0.0.0"
+  port: 8765
+  # 推送频率限制（毫秒，0=不限制）
+  push_interval: 100
+  # 是否推送检测图片（base64）
+  send_image: true
+  # 图片缩放比例（降低带宽）
+  image_scale: 0.5
+  # 图片质量 (1-100)
+  image_quality: 70
+
+# 日志配置
+logging:
+  level: "INFO"
+  # 日志文件路径
+  file: "logs/app.log"
+  # 日志文件最大大小（MB）
+  max_size: 10
+  # 日志文件保留数量
+  backup_count: 5

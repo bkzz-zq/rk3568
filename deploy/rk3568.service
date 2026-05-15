@@ -1,0 +1,29 @@
+[Unit]
+Description=RK3568 Smart Vision Detection System
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+# 工作目录和启动命令（部署脚本会自动替换路径）
+WorkingDirectory=/opt/rk3568
+ExecStart=/opt/rk3568/.venv/bin/python3 /opt/rk3568/src/main.py
+ExecStop=/bin/kill -SIGTERM $MAINPID
+
+# 自动重启
+Restart=on-failure
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rk3568-vision
+
+# 资源限制
+LimitNICE=10
+
+[Install]
+WantedBy=multi-user.target

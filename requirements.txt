@@ -1,0 +1,28 @@
+# RK3568 智能视觉识别系统 - Python 依赖
+
+# 核心依赖
+numpy>=1.24.0
+opencv-python>=4.8.0
+pyyaml>=6.0
+
+# WebSocket 推送
+websockets>=12.0
+
+# 行人检测 (YOLOv8) - PC 开发调试用
+# ultralytics>=8.1.0
+
+# 车牌识别 (二选一)
+# hyperlpr3>=0.1.0
+
+# 文字识别
+# paddleocr>=2.7.0
+# paddlepaddle>=2.5.0
+
+# RKNN NPU 加速 (仅在 RK3568 上安装)
+# rknnlite2>=2.0.0
+
+# 注意:
+# 1. 标记为注释的包需要根据实际环境手动安装
+# 2. RK3568 上安装: pip install rknnlite2
+# 3. PaddleOCR 在 ARM 上需要安装 paddlepaddle 的 ARM 版本
+# 4. ultralytics 在 RK3568 上可以不装，使用 RKNN 推理
