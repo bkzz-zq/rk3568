@@ -8,8 +8,9 @@ from src.utils.image import letterbox
 
 logger = setup_logger("person_detector")
 
-# COCO 数据集中 person 类别 ID
+# COCO 数据集中相关类别 ID
 PERSON_CLASS_ID = 0
+VEHICLE_CLASS_IDS = [2, 5, 7]  # car=2, bus=5, truck=7
 
 
 class PersonDetector:
@@ -27,8 +28,12 @@ class PersonDetector:
         self.npu_enabled = npu_enabled
         self.confidence = config.get("confidence", 0.5)
         self.nms_threshold = config.get("nms_threshold", 0.4)
+        self.vehicle_confidence = config.get("vehicle_confidence", 0.4)
         self.model = None
         self.input_size = (640, 640)
+
+        # 缓存最近一次车辆检测结果（供车牌检测使用）
+        self._last_vehicles = []
 
         logger.info(f"行人检测器初始化 (NPU={'开启' if npu_enabled else '关闭'})")
 
@@ -120,19 +125,122 @@ class PersonDetector:
 
         return results
 
+    def detect_vehicles(self, frame: np.ndarray) -> list:
+        """
+        检测车辆（car, bus, truck），并缓存结果供车牌检测使用
+
+        Args:
+            frame: BGR 图像
+
+        Returns:
+            车辆检测结果列表
+        """
+        if self.model is None:
+            return []
+
+        start_time = time.time()
+
+        if self.npu_enabled:
+            results = self._detect_vehicles_rknn(frame)
+        elif self._backend == "ultralytics":
+            results = self._detect_vehicles_ultralytics(frame)
+        else:
+            results = self._detect_vehicles_opencv_dnn(frame)
+
+        # 缓存车辆检测结果
+        self._last_vehicles = results
+
+        elapsed = (time.time() - start_time) * 1000
+        logger.debug(f"车辆检测耗时: {elapsed:.1f}ms, 检测到 {len(results)} 辆车")
+
+        return results
+
+    @property
+    def last_vehicles(self) -> list:
+        """获取最近一次车辆检测结果"""
+        return self._last_vehicles
+
     def _detect_rknn(self, frame: np.ndarray) -> list:
         """使用 RKNN NPU 进行检测"""
-        # 预处理：letterbox + BGR→RGB
         img, ratio, (dw, dh) = letterbox(frame, self.input_size)
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # RKNNLite 需要 4 维输入 (1, H, W, C)，uint8 格式，归一化由 NPU 完成
         img = np.expand_dims(img, 0).astype(np.uint8)
-
-        # 推理
         outputs = self.model.inference(inputs=[img])
-
-        # 后处理
         return self._postprocess_yolo(outputs[0], frame.shape, ratio, dw, dh)
+
+    def _detect_vehicles_rknn(self, frame: np.ndarray) -> list:
+        """使用 RKNN NPU 检测车辆（复用同一个模型，只过滤车辆类别）"""
+        img, ratio, (dw, dh) = letterbox(frame, self.input_size)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = np.expand_dims(img, 0).astype(np.uint8)
+        outputs = self.model.inference(inputs=[img])
+        return self._postprocess_vehicles(outputs[0], frame.shape, ratio, dw, dh)
+
+    def _detect_vehicles_ultralytics(self, frame: np.ndarray) -> list:
+        """使用 ultralytics YOLO 检测车辆"""
+        results = self.model(frame, conf=self.vehicle_confidence, classes=VEHICLE_CLASS_IDS, verbose=False)
+        detections = []
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                cls_id = int(box.cls[0].cpu().numpy())
+                label_map = {2: "car", 5: "bus", 7: "truck"}
+                detections.append({
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "confidence": round(float(box.conf[0].cpu().numpy()), 3),
+                    "label": label_map.get(cls_id, "vehicle"),
+                })
+        return detections
+
+    def _detect_vehicles_opencv_dnn(self, frame: np.ndarray) -> list:
+        """使用 OpenCV DNN 检测车辆"""
+        h, w = frame.shape[:2]
+        img, ratio, (dw, dh) = letterbox(frame, self.input_size)
+        blob = cv2.dnn.blobFromImage(img, 1.0 / 255.0, self.input_size, swapRB=True)
+        self.model.setInput(blob)
+        outputs = self.model.forward()
+        return self._postprocess_vehicles(outputs, (h, w), ratio, dw, dh)
+
+    def _postprocess_vehicles(self, output, orig_shape, ratio, dw, dh) -> list:
+        """YOLOv8 后处理 - 车辆类别"""
+        oh, ow = orig_shape[:2]
+        label_map = {2: "car", 5: "bus", 7: "truck"}
+        detections = []
+
+        if len(output.shape) == 3:
+            output = output[0]
+        if output.shape[0] < output.shape[1]:
+            output = output.T
+
+        for det in output:
+            x, y, w, h = det[:4]
+            class_scores = det[4:]
+            if len(class_scores) < 8:
+                continue
+
+            # 找车辆类别最高分
+            best_score = 0
+            best_cls = -1
+            for cls_id in VEHICLE_CLASS_IDS:
+                if cls_id < len(class_scores) and class_scores[cls_id] > best_score:
+                    best_score = class_scores[cls_id]
+                    best_cls = cls_id
+
+            if best_score < self.vehicle_confidence:
+                continue
+
+            x1 = max(0, min(int((x - w/2 - dw) / ratio), ow))
+            y1 = max(0, min(int((y - h/2 - dh) / ratio), oh))
+            x2 = max(0, min(int((x + w/2 - dw) / ratio), ow))
+            y2 = max(0, min(int((y + h/2 - dh) / ratio), oh))
+
+            detections.append({
+                "bbox": [x1, y1, x2, y2],
+                "confidence": round(float(best_score), 3),
+                "label": label_map.get(best_cls, "vehicle"),
+            })
+
+        return self._nms(detections)
 
     def _detect_ultralytics(self, frame: np.ndarray) -> list:
         """使用 ultralytics YOLO 进行检测"""

@@ -61,9 +61,14 @@ class PlateDetector:
             logger.error(f"加载车牌识别模型失败: {e}")
             return False
 
-    def detect(self, frame: np.ndarray) -> list:
+    def detect(self, frame: np.ndarray, vehicle_regions: list = None) -> list:
         """
         检测和识别车牌
+
+        Args:
+            frame: BGR 图像
+            vehicle_regions: NPU 检测到的车辆区域 [{"bbox": [x1,y1,x2,y2], ...}, ...]
+                            如果提供，只在车辆区域内搜索车牌（大幅加速）
 
         Returns:
             检测结果列表: [{"bbox": [x1,y1,x2,y2], "confidence": float, "label": "plate", "plate_number": "京A12345", "plate_color": "蓝"}]
@@ -73,25 +78,76 @@ class PlateDetector:
 
         start_time = time.time()
 
-        # 裁剪 ROI 区域（减少检测范围，提高速度和准确率）
-        roi_frame, roi_offset = self._crop_roi(frame)
-
-        if self._backend == "hyperlpr3":
-            results = self._detect_hyperlpr3(roi_frame)
+        # 如果有车辆区域，只在车辆区域内检测车牌（大幅缩小搜索范围）
+        if vehicle_regions and len(vehicle_regions) > 0:
+            results = self._detect_in_vehicles(frame, vehicle_regions)
         else:
-            results = self._detect_paddleocr(roi_frame)
+            # 回退到 ROI 全区域检测
+            roi_frame, roi_offset = self._crop_roi(frame)
 
-        # 将 ROI 区域坐标映射回原图
-        if roi_offset:
-            for r in results:
-                r["bbox"] = [r["bbox"][0] + roi_offset[0], r["bbox"][1] + roi_offset[1],
-                              r["bbox"][2] + roi_offset[0], r["bbox"][3] + roi_offset[1]]
+            if self._backend == "hyperlpr3":
+                results = self._detect_hyperlpr3(roi_frame)
+            else:
+                results = self._detect_paddleocr(roi_frame)
+
+            if roi_offset:
+                for r in results:
+                    r["bbox"] = [r["bbox"][0] + roi_offset[0], r["bbox"][1] + roi_offset[1],
+                                  r["bbox"][2] + roi_offset[0], r["bbox"][3] + roi_offset[1]]
 
         elapsed = (time.time() - start_time) * 1000
-        roi_info = f" (ROI: {roi_frame.shape[1]}x{roi_frame.shape[0]})" if roi_offset else ""
-        logger.info(f"车牌识别耗时: {elapsed:.1f}ms, 识别到 {len(results)} 个车牌{roi_info}")
+        logger.info(f"车牌识别耗时: {elapsed:.1f}ms, 识别到 {len(results)} 个车牌"
+                     f"{' (车辆辅助)' if vehicle_regions else ''}")
 
         return results
+
+    def _detect_in_vehicles(self, frame: np.ndarray, vehicles: list) -> list:
+        """在 NPU 检测到的车辆区域内搜索车牌（核心优化）"""
+        all_results = []
+        h, w = frame.shape[:2]
+
+        for vehicle in vehicles:
+            vx1, vy1, vx2, vy2 = vehicle["bbox"]
+
+            # 车牌一般在车辆下半部分，聚焦该区域
+            vehicle_h = vy2 - vy1
+            vehicle_w = vx2 - vx1
+
+            # 只取车辆下半部分（车牌位置），加一些余量
+            plate_y1 = max(0, vy1 + int(vehicle_h * 0.4))
+            plate_y2 = min(h, vy2 + int(vehicle_h * 0.1))
+            plate_x1 = max(0, vx1 - int(vehicle_w * 0.05))
+            plate_x2 = min(w, vx2 + int(vehicle_w * 0.05))
+
+            crop = frame[plate_y1:plate_y2, plate_x1:plate_x2]
+            if crop.size == 0 or crop.shape[0] < 10 or crop.shape[1] < 20:
+                continue
+
+            # 在裁剪区域内检测车牌
+            if self._backend == "hyperlpr3":
+                detections = self._detect_hyperlpr3(crop)
+            else:
+                detections = self._detect_paddleocr(crop)
+
+            # 将坐标映射回原图
+            for r in detections:
+                r["bbox"] = [r["bbox"][0] + plate_x1, r["bbox"][1] + plate_y1,
+                              r["bbox"][2] + plate_x1, r["bbox"][3] + plate_y1]
+                all_results.append(r)
+
+        # 如果车辆区域都没检测到，回退到 ROI 全区域检测（兜底）
+        if not all_results:
+            roi_frame, roi_offset = self._crop_roi(frame)
+            if self._backend == "hyperlpr3":
+                all_results = self._detect_hyperlpr3(roi_frame)
+            else:
+                all_results = self._detect_paddleocr(roi_frame)
+            if roi_offset:
+                for r in all_results:
+                    r["bbox"] = [r["bbox"][0] + roi_offset[0], r["bbox"][1] + roi_offset[1],
+                                  r["bbox"][2] + roi_offset[0], r["bbox"][3] + roi_offset[1]]
+
+        return all_results
 
     def _crop_roi(self, frame: np.ndarray) -> tuple:
         """
