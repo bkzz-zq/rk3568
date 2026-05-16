@@ -1,6 +1,9 @@
 # 车牌检测 NPU 加速方案 - 完整操作指南
 
 > 目标：将 HyperLPR3 的车牌检测模型转为 RKNN 格式，用 NPU 加速检测（~500ms → ~30ms）
+> 
+> ⚠️ **当前状态**：因 RK3568 只有单 NPU（0.8 TOPS），车牌 NPU 模式与行人检测冲突。
+> 当前使用 HyperLPR3 CPU 模式（~120ms），待后续支持多模型 NPU 调度后启用。
 
 ---
 
@@ -61,9 +64,9 @@ wsl
 cd /mnt/d/VsSlave/Python_code/rk3568
 
 # 激活 rknn-toolkit2 环境（根据你的实际环境名）
-conda activate rknn
+#conda activate rknn
 # 或
-# source ~/rknn_env/bin/activate
+source ~/rknn_env/bin/activate
 
 # 确认 rknn-toolkit2 可用
 python3 -c "from rknn.api import RKNN; print('RKNN OK')"

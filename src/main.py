@@ -1,10 +1,17 @@
-"""RK3568 智能视觉识别系统 - 主入口"""
+"""RK3568 智能视觉识别系统 - 多线程流水线架构
+
+流水线:
+  线程1 (CameraStream): GStreamer 硬解码 → 最新帧缓存
+  线程2 (检测线程):     取帧 → 缩放 → NPU行人+CPU车牌并行 → 结果缓存
+  主线程 (推送线程):     读缓存结果 → WebSocket推送 → FPS统计
+"""
 
 import os
 import sys
 import time
 import signal
 import argparse
+import threading
 import cv2
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -16,7 +23,6 @@ from src.utils.logger import setup_logger
 from src.camera import CameraStream
 from src.detector.person import PersonDetector
 from src.detector.plate import PlateDetector
-from src.detector.ocr import OCRDetector
 from src.pusher.ws_pusher import WebSocketPusher
 
 
@@ -27,7 +33,6 @@ def main():
     parser.add_argument("--no-npu", action="store_true", help="禁用 NPU，使用 CPU")
     parser.add_argument("--no-person", action="store_true", help="禁用行人检测")
     parser.add_argument("--no-plate", action="store_true", help="禁用车牌识别")
-    parser.add_argument("--no-ocr", action="store_true", help="禁用文字识别")
     args = parser.parse_args()
 
     # 加载配置
@@ -35,7 +40,7 @@ def main():
     logger = setup_logger(config=config.get("logging"))
 
     logger.info("=" * 60)
-    logger.info("RK3568 智能视觉识别系统启动")
+    logger.info("RK3568 智能视觉识别系统启动（多线程流水线）")
     logger.info("=" * 60)
 
     # NPU 配置
@@ -52,8 +57,6 @@ def main():
     # 初始化检测器
     person_detector = None
     plate_detector = None
-    ocr_detector = None
-
     # 行人检测
     if config.get("person_detection.enabled", True) and not args.no_person:
         person_config = config.get("person_detection")
@@ -64,32 +67,70 @@ def main():
             logger.warning("✗ 行人检测模块加载失败")
             person_detector = None
 
-    # 车牌识别
+    # 车牌识别（HyperLPR3 CPU模式）
     if config.get("plate_recognition.enabled", True) and not args.no_plate:
         plate_config = config.get("plate_recognition")
-        plate_detector = PlateDetector(plate_config, npu_enabled=npu_enabled)
+        plate_detector = PlateDetector(plate_config, npu_enabled=False)
         if plate_detector.load_model():
             logger.info("✓ 车牌识别模块就绪")
         else:
             logger.warning("✗ 车牌识别模块加载失败")
             plate_detector = None
 
-    # 文字识别
-    if config.get("ocr.enabled", True) and not args.no_ocr:
-        ocr_config = config.get("ocr")
-        ocr_detector = OCRDetector(ocr_config)
-        if ocr_detector.load_model():
-            logger.info("✓ 文字识别模块就绪")
-        else:
-            logger.warning("✗ 文字识别模块加载失败")
-            ocr_detector = None
-
     # 初始化 WebSocket 推送
     ws_config = config.get("websocket")
     pusher = WebSocketPusher(ws_config)
     pusher.start()
 
-    # 启动视频流
+    # ── 智能家居 IoT 服务 ──────────────────────────────
+    mqtt_client = None
+    iot_server_thread = None
+    sensor_collect_timer = None
+
+    if config.get("iot.enabled", False):
+        try:
+            from src.iot.mqtt_client import MQTTClient
+            from src.iot.server import run_server, set_mqtt_client, collect_sensor_data
+
+            # 启动 MQTT 客户端
+            mqtt_config = config.get("iot.mqtt", {})
+            mqtt_client = MQTTClient(mqtt_config)
+            mqtt_client.start()
+
+            # 注入到 FastAPI
+            set_mqtt_client(mqtt_client)
+
+            # 启动 FastAPI 服务（独立线程）
+            server_config = config.get("iot.server", {})
+            iot_server_thread = threading.Thread(
+                target=run_server,
+                kwargs={
+                    "host": server_config.get("host", "0.0.0.0"),
+                    "port": server_config.get("port", 8000),
+                },
+                daemon=True,
+            )
+            iot_server_thread.start()
+            logger.info("✓ 智能家居 IoT 服务已启动")
+
+            # 传感器数据采集定时器
+            collect_interval = config.get("iot.sensor_collect_interval", 180)
+
+            def sensor_collect_loop():
+                while running:
+                    time.sleep(collect_interval)
+                    collect_sensor_data()
+
+            sensor_collect_timer = threading.Thread(target=sensor_collect_loop, daemon=True)
+            sensor_collect_timer.start()
+
+        except ImportError as e:
+            logger.warning(f"智能家居模块导入失败（缺少依赖）: {e}")
+            logger.warning("安装: pip install fastapi uvicorn paho-mqtt PyJWT")
+        except Exception as e:
+            logger.warning(f"智能家居服务启动失败: {e}")
+
+    # 启动视频流（线程1: 解码）
     camera.start()
 
     # 信号处理
@@ -103,129 +144,147 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 检测优化参数
-    DETECT_WIDTH = 640           # 检测时缩放到的宽度
-    DETECT_INTERVAL = 3          # 行人检测：每隔几帧做一次检测
-    PLATE_DETECT_INTERVAL = 6    # 车牌检测：每隔几帧做一次（NPU加速后可降低间隔）
-    DETECT_SCALE = None          # 缓存缩放比例
-    VEHICLE_ASSIST = True        # NPU 车辆辅助车牌检测（零成本优化）
+    # ── 共享检测结果（线程安全）──────────────────────────
+    results_lock = threading.Lock()
+    cached_results = {
+        "persons": None,
+        "plates": None,
+    }
 
-    # 并行检测线程池
-    detector_executor = ThreadPoolExecutor(max_workers=3)
+    # ── 线程2: 检测线程 ─────────────────────────────────
+    detect_running = True
 
-    # 主循环
-    logger.info("开始实时检测...")
-    logger.info(f"检测优化: 缩放到 {DETECT_WIDTH}px, 每 {DETECT_INTERVAL} 帧检测一次, 并行检测")
-    logger.info(f"WebSocket 客户端连接数: {pusher.client_count}")
+    def detection_loop():
+        """检测线程：持续取帧 → 缩放 → 检测 → 更新缓存"""
+        DETECT_WIDTH = 640
+        PERSON_INTERVAL = 3       # 行人检测：每3帧检测一次
+        PLATE_INTERVAL = 9        # 车牌检测：每9帧检测一次（CPU密集）
+        detect_scale = None
+        frame_count = 0
 
-    frame_count = 0
-    fps_start_time = time.time()
-    fps = 0.0
+        # 检测内部并行线程池
+        executor = ThreadPoolExecutor(max_workers=3)
 
-    # 缓存上一次检测结果（用于非检测帧的推送）
-    last_persons = None
-    last_plates = None
-    last_texts = None
-    last_vehicles = []           # 缓存 NPU 车辆检测结果（供车牌检测使用）
+        logger.info("检测线程已启动")
 
-    # 辅助函数：检测并还原坐标（同时还原缓存的车辆坐标）
-    def _detect_and_rescale(detector, frame, scale):
-        results = detector.detect(frame)
-        for r in results:
-            r["bbox"] = [int(v / scale) for v in r["bbox"]]
-        # 同时还原缓存的车辆检测坐标到原图
-        if detector is person_detector:
-            for v in person_detector._last_vehicles:
-                v["bbox"] = [int(v / scale) for v in v["bbox"]]
-        return results
-
-    try:
-        while running:
-            # 获取帧
+        while detect_running:
             frame = camera.get_frame()
             if frame is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
 
             frame_count += 1
             h, w = frame.shape[:2]
 
-            # 计算检测缩放比例（仅第一次）
-            if DETECT_SCALE is None:
-                DETECT_SCALE = DETECT_WIDTH / w
-                logger.info(f"检测缩放比例: {DETECT_SCALE:.2f} ({w}x{h} -> {int(w*DETECT_SCALE)}x{int(h*DETECT_SCALE)})")
-
-            # 降频检测：行人每 DETECT_INTERVAL 帧，车牌每 PLATE_DETECT_INTERVAL 帧
-            need_person_detect = (frame_count % DETECT_INTERVAL == 0)
-            need_plate_detect = (frame_count % PLATE_DETECT_INTERVAL == 0)
-            need_ocr_detect = need_plate_detect  # OCR 跟随车牌频率
-            need_detect = need_person_detect or need_plate_detect or (ocr_detector is not None and need_ocr_detect)
-
-            if need_detect:
-                # 缩小分辨率用于检测
-                if DETECT_SCALE != 1.0:
-                    small_frame = cv2.resize(frame, None, fx=DETECT_SCALE, fy=DETECT_SCALE, interpolation=cv2.INTER_LINEAR)
+            # 计算缩放比例（仅第一次）
+            if detect_scale is None:
+                if camera.decode_mode == "gst_hw":
+                    # GStreamer 已缩放，用 output_scale 还原坐标到原始分辨率
+                    detect_scale = camera.output_scale
+                    logger.info(f"检测缩放: GStreamer 已缩放，output_scale={detect_scale:.2f}")
                 else:
-                    small_frame = frame
+                    detect_scale = DETECT_WIDTH / w
+                    logger.info(f"检测缩放: {w}x{h} → {int(w * detect_scale)}x{int(h * detect_scale)} "
+                                f"(scale={detect_scale:.2f})")
 
-                # 按需提交检测任务
-                futures = {}
+            # 判断本轮需要哪些检测
+            need_person = (frame_count % PERSON_INTERVAL == 0)
+            need_plate = (frame_count % PLATE_INTERVAL == 0)
 
-                # 行人检测（NPU 模式下同时缓存车辆结果）
-                if person_detector is not None and need_person_detect:
-                    futures[detector_executor.submit(
-                        _detect_and_rescale, person_detector, small_frame, DETECT_SCALE
-                    )] = "person"
+            if not need_person and not need_plate:
+                continue
 
-                # 车牌检测：使用行人检测时缓存的车辆区域
-                if plate_detector is not None and need_plate_detect:
-                    # 从行人检测中获取缓存的车辆结果（一次 NPU 推理，零额外开销）
-                    vehicle_regions = None
-                    if VEHICLE_ASSIST and person_detector is not None and person_detector.last_vehicles:
-                        vehicle_regions = person_detector.last_vehicles
-                        logger.info(f"NPU 辅助: 检测到 {len(vehicle_regions)} 辆车，缩小车牌搜索范围")
+            # 缩小分辨率用于检测（GStreamer 硬解码已缩放，无需再 resize）
+            if camera.decode_mode == "gst_hw":
+                small_frame = frame
+            else:
+                small_frame = cv2.resize(
+                    frame, None, fx=detect_scale, fy=detect_scale,
+                    interpolation=cv2.INTER_LINEAR
+                )
 
-                    futures[detector_executor.submit(
-                        plate_detector.detect, frame, vehicle_regions
-                    )] = "plate"
-                if ocr_detector is not None and need_ocr_detect:
-                    futures[detector_executor.submit(
-                        _detect_and_rescale, ocr_detector, small_frame, DETECT_SCALE
-                    )] = "ocr"
+            # 提交并行检测任务
+            futures = {}
 
-                # 收集并行检测结果
-                for future in as_completed(futures):
-                    name = futures[future]
-                    try:
-                        result = future.result()
-                        if name == "person":
-                            last_persons = result
-                        elif name == "plate":
-                            last_plates = result
-                        elif name == "ocr":
-                            last_texts = result
-                    except Exception as e:
-                        logger.error(f"{name} 检测异常: {e}")
+            if person_detector is not None and need_person:
+                futures[executor.submit(person_detector.detect, small_frame)] = "person"
 
-            # 使用缓存的检测结果
-            persons = last_persons
-            plates = last_plates
-            texts = last_texts
+            if plate_detector is not None and need_plate:
+                futures[executor.submit(plate_detector.detect, frame)] = "plate"
 
-            # 推送检测结果（仅 JSON，无图像编码开销）
+            # 收集并行检测结果
+            new_persons = None
+            new_plates = None
+
+            for future in as_completed(futures):
+                name = futures[future]
+                try:
+                    result = future.result()
+
+                    if name == "person":
+                        # 坐标从小图还原到原图
+                        for r in result:
+                            r["bbox"] = [int(v / detect_scale) for v in r["bbox"]]
+                        new_persons = result
+
+                    elif name == "plate":
+                        # 坐标从检测帧还原到原图
+                        for r in result:
+                            r["bbox"] = [int(v / detect_scale) for v in r["bbox"]]
+                        new_plates = result
+
+                except Exception as e:
+                    logger.error(f"{name} 检测异常: {e}")
+
+            # 更新缓存结果（快速加锁）
+            with results_lock:
+                if new_persons is not None:
+                    cached_results["persons"] = new_persons
+                if new_plates is not None:
+                    cached_results["plates"] = new_plates
+        executor.shutdown(wait=False)
+        logger.info("检测线程已退出")
+
+    # 启动检测线程
+    detect_thread = threading.Thread(target=detection_loop, daemon=True)
+    detect_thread.start()
+
+    # ── 主线程: 推送循环 ────────────────────────────────
+    logger.info("主推送循环已启动")
+    logger.info(f"WebSocket 客户端连接数: {pusher.client_count}")
+
+    fps_frame_count = 0
+    fps_start_time = time.time()
+    fps = 0.0
+
+    try:
+        while running:
+            # 读取缓存结果（不等待检测完成）
+            with results_lock:
+                persons = cached_results["persons"]
+                plates = cached_results["plates"]
+            # 同步 AI 结果到 IoT 服务器
+            if mqtt_client is not None:
+                try:
+                    from src.iot.server import set_ai_results
+                    set_ai_results(persons, plates)
+                except Exception:
+                    pass
+
+            # 推送检测结果
             pusher.push_results(
                 persons=persons,
                 plates=plates,
-                texts=texts,
                 fps=fps,
                 plate_roi=plate_detector.roi if plate_detector else None,
             )
 
-            # 计算 FPS
+            # FPS 统计
+            fps_frame_count += 1
             elapsed = time.time() - fps_start_time
             if elapsed >= 1.0:
-                fps = frame_count / elapsed
-                frame_count = 0
+                fps = fps_frame_count / elapsed
+                fps_frame_count = 0
                 fps_start_time = time.time()
 
                 summary_parts = []
@@ -233,29 +292,36 @@ def main():
                     summary_parts.append(f"行人:{len(persons)}")
                 if plates is not None:
                     summary_parts.append(f"车牌:{len(plates)}")
-                if texts is not None:
-                    summary_parts.append(f"文字:{len(texts)}")
-
                 logger.info(
-                    f"FPS: {fps:.1f} | {', '.join(summary_parts)} | 客户端: {pusher.client_count}"
+                    f"FPS: {fps:.1f} | {', '.join(summary_parts)} | "
+                    f"客户端: {pusher.client_count} | "
+                    f"解码: {camera.decode_mode}"
                 )
+
+            # 推送频率控制（避免空转占 CPU）
+            time.sleep(0.02)  # ~50fps 上限
 
     except KeyboardInterrupt:
         logger.info("用户中断")
     finally:
+        # 停止检测线程
+        detect_running = False
+        detect_thread.join(timeout=3)
+
         # 清理资源
         logger.info("正在释放资源...")
-        detector_executor.shutdown(wait=False)
         camera.stop()
 
         if person_detector is not None:
             person_detector.release()
         if plate_detector is not None:
             plate_detector.release()
-        if ocr_detector is not None:
-            ocr_detector.release()
-
         pusher.stop()
+
+        # 停止 IoT 服务
+        if mqtt_client is not None:
+            mqtt_client.stop()
+
         logger.info("系统已停止")
 
 

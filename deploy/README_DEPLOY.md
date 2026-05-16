@@ -117,6 +117,17 @@ sudo cp librknnrt.so /usr/lib/
 sudo ldconfig
 ```
 
+### 安装 GStreamer + MPP 硬解码
+
+```bash
+# 安装 GStreamer 插件
+sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-rockchip
+
+# 验证
+gst-inspect-1.0 mppvideodec    # VPU 硬解码
+gst-inspect-1.0 videoscale      # 硬件缩放
+```
+
 ### 安装 Python 依赖
 
 ```bash
@@ -127,14 +138,28 @@ source .venv/bin/activate
 # 配置清华镜像
 pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
-# 核心依赖
-pip install numpy opencv-python-headless pyyaml websockets
+# 核心依赖（NumPy 必须 < 2，系统 OpenCV 不兼容 NumPy 2.x）
+pip install "numpy<2" pyyaml websockets
 
 # RKNN
 pip install rknnlite2
 
 # AI 库
 pip install paddlepaddle paddleocr hyperlpr3
+```
+
+### 链接系统 OpenCV（支持 GStreamer 硬解码）
+
+```bash
+# pip 安装的 opencv-python 没有 GStreamer 后端，必须链接系统版本
+pip uninstall opencv-python opencv-python-headless -y
+rm -rf .venv/lib/python3.10/site-packages/cv2
+ln -sf /usr/lib/python3/dist-packages/cv2 .venv/lib/python3.10/site-packages/cv2
+ln -sf /usr/lib/python3/dist-packages/cv2.cpython-310-aarch64-linux-gnu.so .venv/lib/python3.10/site-packages/
+
+# 验证
+python3 -c "import cv2; print(cv2.getBuildInformation())" | grep -i gstreamer
+# 应显示: GStreamer: YES
 ```
 
 ## NPU 驱动检查

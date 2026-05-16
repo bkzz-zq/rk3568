@@ -12,6 +12,8 @@ camera:
   fps_limit: 15
   # 重新连接间隔（秒）
   reconnect_interval: 5
+  # 硬件解码（GStreamer + MPP，不可用时自动回退 FFmpeg 软解码）
+  hw_decode: true
 
 # 行人检测配置
 person_detection:
@@ -45,24 +47,23 @@ plate_recognition:
   # [左边, 上边, 右边, 下边]，例如 [0.1, 0.4, 0.9, 0.95] 表示画面下半部分
   roi: [0.1, 0.4, 0.9, 0.95]
 
-# 文字识别配置 (PaddleOCR)
-ocr:
-  enabled: true
-  # 检测置信度
-  det_threshold: 0.5
-  # 识别置信度
-  rec_threshold: 0.5
-  # 语言
-  lang: "ch"
-  # 使用角度分类
-  use_angle_cls: true
-
 # RKNN NPU 配置
 npu:
   # 是否启用 NPU 加速（false 则使用 CPU）
   enabled: true
   # RKNN 目标平台
   target: "rk3568"
+
+# 智能家居服务器
+iot:
+  enabled: true
+  mqtt:
+    host: "127.0.0.1"    # 本地 mosquitto broker
+    port: 1883
+  server:
+    host: "0.0.0.0"
+    port: 8000
+  sensor_collect_interval: 180  # 传感器数据采集间隔（秒）
 
 # WebSocket 推送配置
 websocket:

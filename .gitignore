@@ -34,5 +34,8 @@ test_frame.*
 .DS_Store
 Thumbs.db
 
+# 客户端本地配置
+pc_client/client_config.json
+
 # 敏感信息（配置文件中有密码）
 # config/config.yaml  # 如需公开仓库，取消注释此行

@@ -146,6 +146,9 @@ class PCClient:
         print("按 'q' 退出")
 
         window_name = "RK3568 Vision Detection"
+        # 创建可调整大小的窗口
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, 1280, 720)
         frame_count = 0
         fps_start = time.time()
         display_fps = 0.0
@@ -253,6 +256,7 @@ class PCClient:
         # 车牌检测框（红色）+ 中文文字
         for plate in detections.get("plates", []):
             bbox = plate.get("bbox")
+            bbox = plate.get("bbox")
             if bbox and len(bbox) == 4:
                 x1, y1, x2, y2 = bbox
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
@@ -333,23 +337,144 @@ class PCClient:
             self.running = False
 
 
+# ── 配置文件路径 ──────────────────────────────────────
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_config.json")
+
+
+def _load_saved_config() -> dict:
+    """加载保存的客户端配置"""
+    try:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_config(cfg: dict):
+    """保存客户端配置"""
+    try:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"保存配置失败: {e}")
+
+
+def _show_connect_dialog(saved: dict) -> dict | None:
+    """弹出 tkinter 连接设置对话框，返回配置 dict 或 None（取消）"""
+    import tkinter as tk
+    from tkinter import ttk
+
+    result = {"confirmed": False}
+
+    root = tk.Tk()
+    root.title("RK3568 连接设置")
+    root.resizable(False, False)
+    root.configure(padx=20, pady=15)
+
+    # 居中显示
+    root.update_idletasks()
+    w, h = 420, 260
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry(f"{w}x{h}+{x}+{y}")
+
+    # 标题
+    tk.Label(root, text="RK3568 视觉识别系统", font=("Microsoft YaHei", 14, "bold")).pack(pady=(0, 10))
+
+    # IP 输入
+    frame_ip = tk.Frame(root)
+    frame_ip.pack(fill="x", pady=5)
+    tk.Label(frame_ip, text="板子 IP:", font=("Microsoft YaHei", 10)).pack(side="left")
+    ip_var = tk.StringVar(value=saved.get("host", "192.168.0.100"))
+    ip_entry = tk.Entry(frame_ip, textvariable=ip_var, font=("Consolas", 11), width=20)
+    ip_entry.pack(side="left", padx=(10, 0))
+    ip_entry.select_range(0, tk.END)
+    ip_entry.focus_set()
+
+    # 端口输入
+    frame_port = tk.Frame(root)
+    frame_port.pack(fill="x", pady=5)
+    tk.Label(frame_port, text="端  口:", font=("Microsoft YaHei", 10)).pack(side="left")
+    port_var = tk.StringVar(value=str(saved.get("port", 8765)))
+    tk.Entry(frame_port, textvariable=port_var, font=("Consolas", 11), width=20).pack(side="left", padx=(10, 0))
+
+    # RTSP 地址输入（默认自动生成主码流地址）
+    default_rtsp = saved.get("rtsp", "rtsp://admin:sdxyp123@192.168.0.66:554/Streaming/Channels/101")
+    frame_rtsp = tk.Frame(root)
+    frame_rtsp.pack(fill="x", pady=5)
+    tk.Label(frame_rtsp, text="RTSP:", font=("Microsoft YaHei", 10)).pack(side="left")
+    rtsp_var = tk.StringVar(value=default_rtsp)
+    tk.Entry(frame_rtsp, textvariable=rtsp_var, font=("Consolas", 9), width=32).pack(side="left", padx=(10, 0))
+
+    # 按钮
+    frame_btn = tk.Frame(root)
+    frame_btn.pack(pady=(15, 0))
+
+    def on_connect():
+        result["confirmed"] = True
+        result["host"] = ip_var.get().strip()
+        try:
+            result["port"] = int(port_var.get().strip())
+        except ValueError:
+            result["port"] = 8765
+        result["rtsp"] = rtsp_var.get().strip() or None
+        root.destroy()
+
+    def on_cancel():
+        root.destroy()
+
+    tk.Button(frame_btn, text="连接", width=10, command=on_connect,
+              font=("Microsoft YaHei", 10)).pack(side="left", padx=10)
+    tk.Button(frame_btn, text="取消", width=10, command=on_cancel,
+              font=("Microsoft YaHei", 10)).pack(side="left", padx=10)
+
+    # 回车确认
+    root.bind("<Return>", lambda e: on_connect())
+    root.bind("<Escape>", lambda e: on_cancel())
+
+    root.mainloop()
+    return result if result["confirmed"] else None
+
+
 def main():
     """PC 客户端入口"""
     import argparse
 
     parser = argparse.ArgumentParser(description="RK3568 视觉识别 - PC 接收客户端")
-    parser.add_argument("--host", type=str, default="192.168.0.100", help="RK3568 IP 地址")
-    parser.add_argument("--port", type=int, default=8765, help="WebSocket 端口")
+    parser.add_argument("--host", type=str, default=None, help="RK3568 IP 地址（跳过对话框）")
+    parser.add_argument("--port", type=int, default=None, help="WebSocket 端口")
     parser.add_argument("--rtsp", type=str, default=None,
                         help="RTSP 直连地址（可选，直连摄像头显示原始画质）")
     parser.add_argument("--use-main-stream", action="store_true",
                         help="使用主码流（高清）直连，需配置 camera.main_stream")
     args = parser.parse_args()
 
+    # 加载保存的配置
+    saved = _load_saved_config()
+
+    # 如果命令行指定了 host，直接使用（跳过对话框）
+    if args.host:
+        host = args.host
+        port = args.port or 8765
+        rtsp_url = args.rtsp
+    else:
+        # 弹出对话框让用户输入
+        dialog_result = _show_connect_dialog(saved)
+        if dialog_result is None:
+            print("用户取消，退出")
+            return
+
+        host = dialog_result["host"]
+        port = dialog_result["port"]
+        rtsp_url = dialog_result.get("rtsp")
+
+        # 保存配置（下次自动填充）
+        _save_config({"host": host, "port": port, "rtsp": rtsp_url or ""})
+
     # 自动生成 RTSP 地址
-    rtsp_url = args.rtsp
     if not rtsp_url and args.use_main_stream:
-        # 从配置文件读取主码流地址
         try:
             from src.utils.config import config
             config.load()
@@ -358,7 +483,8 @@ def main():
         except Exception:
             pass
 
-    client = PCClient(rtsp_url=rtsp_url, ws_host=args.host, ws_port=args.port)
+    print(f"连接设置: {host}:{port}")
+    client = PCClient(rtsp_url=rtsp_url, ws_host=host, ws_port=port)
 
     def signal_handler(sig, frame):
         print("\n正在停止...")
