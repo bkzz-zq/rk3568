@@ -1,0 +1,317 @@
+# STM32 端适配指南 — 对接 RK3568 MQTT Broker
+
+## 概述
+
+原 STM32 通过 OneNET MQTT 协议连接云平台，现改为直接连接 RK3568 本地 mosquitto broker。
+
+### 架构变化
+
+```
+原架构:
+  STM32 → OneNET MQTT Broker (mqtts.heclouds.com:1883)
+  App   → OneNET HTTP API (查询/控制)
+
+新架构:
+  STM32 → RK3568 mosquitto (192.168.0.100:1883)
+  App   → RK3568 FastAPI (192.168.0.100:8000)
+```
+
+## 1. MQTT 连接参数
+
+### 原参数（OneNET）
+
+| 参数 | 值 |
+|------|-----|
+| Broker | `mqtts.heclouds.com` |
+| Port | `1883` |
+| ClientID | `<设备名称>` |
+| Username | `<产品ID>` |
+| Password | `<OneNET token>` |
+| 协议 | MQTT 3.1.1 |
+
+### 新参数（RK3568）
+
+| 参数 | 值 |
+|------|-----|
+| Broker | `192.168.0.100`（RK3568 IP） |
+| Port | `1883` |
+| ClientID | 任意（如 `esp8266`） |
+| Username | 无（匿名连接） |
+| Password | 无（匿名连接） |
+| 协议 | MQTT 3.1.1 |
+
+**变化**：
+- ✅ 端口不变（1883）
+- ⚠️ Broker 地址改为 RK3568 局域网 IP
+- ⚠️ **不需要认证**（mosquitto 配置为匿名模式）
+- ⚠️ 不需要 OneNET 的 token 认证
+
+## 2. Topic 格式
+
+### 属性上报（STM32 → RK3568）
+
+**原 Topic（OneNET）**：
+```
+$sys/<产品ID>/<设备名称>/thing/property/post
+```
+
+**新 Topic（RK3568）**：
+```
+device/<设备名称>/property/post
+```
+
+例如：`device/esp8266/property/post`
+
+> ⚠️ **必须修改**：STM32 发布的 topic 需要改为新格式。
+
+### 控制命令接收（RK3568 → STM32）
+
+**原 Topic（OneNET）**：
+```
+$sys/<产品ID>/<设备名称>/thing/property/set
+```
+
+**新 Topic（RK3568）**：
+```
+device/<设备名称>/property/set
+```
+
+例如：`device/esp8266/property/set`
+
+> ⚠️ **必须修改**：STM32 订阅的 topic 需要改为新格式。
+
+## 3. 数据格式（兼容 OneNET）
+
+### 属性上报 Payload
+
+**格式不变**（OneNET 兼容格式）：
+```json
+{
+  "id": "123",
+  "params": {
+    "tremp": {
+      "value": 25.5
+    },
+    "hum": {
+      "value": 60
+    },
+    "position": {
+      "value": 50
+    },
+    "limit_sw": {
+      "value": 0
+    }
+  }
+}
+```
+
+**支持的 identifier（属性标识符）**：
+
+| identifier | 类型 | 说明 | 示例 |
+|-----------|------|------|------|
+| `tremp` | float | 温度（°C） | 25.5 |
+| `hum` | int | 湿度（%） | 60 |
+| `position` | int | 门/窗位置（%） | 50 |
+| `limit_sw` | int | 限位开关状态 | 0 |
+
+> ✅ **不需要修改**：payload 格式与 OneNET 完全兼容。
+
+### 控制命令 Payload
+
+App 发送控制命令后，RK3568 通过 MQTT 转发：
+
+```json
+{
+  "params": {
+    "led": true
+  }
+}
+```
+
+STM32 订阅 `device/<设备名称>/property/set` 接收并执行。
+
+## 4. 完整通信流程
+
+```
+┌─────────┐                          ┌──────────┐                    ┌──────────┐
+│  STM32   │                          │  RK3568   │                    │   App    │
+│ (ESP8266)│                          │ mosquitto │                    │ (手机)   │
+└────┬─────┘                          └─────┬─────┘                    └────┬─────┘
+     │                                      │                               │
+     │  1. MQTT CONNECT (匿名)               │                               │
+     │─────────────────────────────────────→│                               │
+     │                                      │                               │
+     │  2. SUBSCRIBE device/esp8266/property/set                            │
+     │─────────────────────────────────────→│                               │
+     │                                      │                               │
+     │  3. PUBLISH device/esp8266/property/post                             │
+     │     {"id":"1","params":{...}}        │                               │
+     │─────────────────────────────────────→│                               │
+     │                                      │  4. App 查询 GET /thingmodel/  │
+     │                                      │     query-device-property      │
+     │                                      │←──────────────────────────────│
+     │                                      │  5. 返回缓存的设备状态          │
+     │                                      │──────────────────────────────→│
+     │                                      │                               │
+     │                                      │  6. App 控制 POST /thingmodel/ │
+     │                                      │     set-device-property        │
+     │                                      │←──────────────────────────────│
+     │                                      │                               │
+     │  7. PUBLISH device/esp8266/property/set                              │
+     │  {"params":{"led":true}}             │                               │
+     │←─────────────────────────────────────│                               │
+     │                                      │                               │
+     │  8. 执行控制 + 上报新状态              │                               │
+     │─────────────────────────────────────→│                               │
+```
+
+## 5. MQTT 连接示例代码（STM32/ESP8266）
+
+### Arduino / ESP8266 示例
+
+```cpp
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+const char* mqtt_server = "192.168.0.100";  // RK3568 IP
+const int mqtt_port = 1883;
+const char* device_name = "esp8266";
+
+void setup_mqtt() {
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqtt_callback);
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    // 匿名连接，不需要用户名密码
+    if (client.connect(device_name)) {
+      // 订阅控制命令 topic
+      client.subscribe("device/esp8266/property/set");
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+// 上报传感器数据
+void publish_sensors(float temp, int hum, int pos, int limit) {
+  char payload[256];
+  snprintf(payload, sizeof(payload),
+    "{\"id\":\"1\",\"params\":{"
+    "\"tremp\":{\"value\":%.1f},"
+    "\"hum\":{\"value\":%d},"
+    "\"position\":{\"value\":%d},"
+    "\"limit_sw\":{\"value\":%d}"
+    "}}",
+    temp, hum, pos, limit);
+
+  client.publish("device/esp8266/property/post", payload);
+}
+
+// 接收控制命令
+void mqtt_callback(char* topic, byte* payload, unsigned int length) {
+  // 解析 JSON，执行控制
+  // {"params":{"led":true}}
+  String msg;
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  // 解析并执行控制命令...
+}
+```
+
+### STM32 HAL + ESP8266 AT 指令示例
+
+```
+// 连接 MQTT Broker
+AT+CIPSTART="TCP","192.168.0.100",1883
+
+// 发送 MQTT CONNECT（匿名，无用户名密码）
+// Client ID: "esp8266"
+
+// 订阅控制 topic
+SUBSCRIBE: device/esp8266/property/set
+
+// 发布传感器数据
+PUBLISH: device/esp8266/property/post
+{"id":"1","params":{"tremp":{"value":25.5},"hum":{"value":60}}}
+```
+
+## 6. STM32 端修改清单
+
+### 必须修改
+
+| 项目 | 原值 | 新值 |
+|------|------|------|
+| MQTT Broker 地址 | `mqtts.heclouds.com` | `192.168.0.100` |
+| MQTT 端口 | `1883` | `1883`（不变） |
+| MQTT 认证 | OneNET token | 无（匿名） |
+| 发布 Topic | `$sys/<产品ID>/<设备名>/thing/property/post` | `device/<设备名>/property/post` |
+| 订阅 Topic | `$sys/<产品ID>/<设备名>/thing/property/set` | `device/<设备名>/property/set` |
+
+### 不需要修改
+
+| 项目 | 说明 |
+|------|------|
+| Payload 格式 | 与 OneNET 完全兼容 |
+| 属性 identifier | `tremp`, `hum`, `position`, `limit_sw` 不变 |
+| MQTT 协议版本 | 3.1.1 不变 |
+| JSON 解析逻辑 | 不变 |
+| 控制命令格式 | 不变 |
+
+## 7. 调试工具
+
+### 在 RK3568 上手动测试 MQTT
+
+```bash
+# 订阅 STM32 的上报数据
+mosquitto_sub -t "device/+/property/post" -v
+
+# 模拟 STM32 上报数据
+mosquitto_pub -t "device/esp8266/property/post" \
+  -m '{"id":"1","params":{"tremp":{"value":25.5},"hum":{"value":60}}}'
+
+# 模拟 App 发送控制命令
+mosquitto_pub -t "device/esp8266/property/set" \
+  -m '{"params":{"led":true}}'
+```
+
+### 查看所有 MQTT 消息
+
+```bash
+# 订阅所有 topic（调试用）
+mosquitto_sub -t "#" -v
+```
+
+## 8. 常见问题
+
+### Q: STM32 连不上 MQTT？
+
+```bash
+# 检查 mosquitto 是否运行
+systemctl status mosquitto
+
+# 检查 1883 端口是否开放
+ss -tlnp | grep 1883
+
+# 查看 mosquitto 日志
+journalctl -u mosquitto -n 20
+```
+
+### Q: 上报数据后 App 看不到？
+
+```bash
+# 查看 STM32 是否发了数据
+mosquitto_sub -t "device/+/property/post" -v
+
+# 查看 FastAPI 日志
+journalctl -u rk3568 -n 20
+```
+
+### Q: 网络不通？
+
+确保 STM32/ESP8266 和 RK3568 在同一局域网（同一网段 `192.168.0.x`）。

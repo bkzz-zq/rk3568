@@ -8,7 +8,7 @@ Type=simple
 User=root
 # 工作目录和启动命令（部署脚本会自动替换路径）
 WorkingDirectory=/opt/rk3568
-ExecStart=/opt/rk3568/.venv/bin/python3 /opt/rk3568/src/main.py
+ExecStart=/bin/bash -c 'source /opt/rk3568/.venv/bin/activate && python3 /opt/rk3568/src/main.py'
 ExecStop=/bin/kill -SIGTERM $MAINPID
 
 # 自动重启
@@ -21,6 +21,19 @@ StartLimitIntervalSec=60
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rk3568-vision
+
+# 环境变量（补齐 GStreamer 和系统变量，修复车牌识别）
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus
+Environment=GST_GL_API=gles2
+Environment=GST_GL_PLATFORM=egl
+Environment=GST_VIDEO_CONVERT_USE_RGA=1
+Environment=GST_VIDEO_FLIP_USE_RGA=1
+Environment=GST_VIDEO_CONVERT_PREFERRED_FORMAT=NV12:NV16:I420:YUY2
+Environment=GST_V4L2_USE_LIBV4L2=1
+Environment=GST_MPP_VP8ENC_FAKE_VP8ENC=1
+Environment=HOME=/root
 
 # 资源限制
 LimitNICE=10

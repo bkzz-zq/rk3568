@@ -82,6 +82,9 @@ def main():
     pusher = WebSocketPusher(ws_config)
     pusher.start()
 
+    # ── 主运行标志（供 signal_handler / sensor_collect_loop 使用）──
+    running = True
+
     # ── 智能家居 IoT 服务 ──────────────────────────────
     mqtt_client = None
     iot_server_thread = None
@@ -90,7 +93,7 @@ def main():
     if config.get("iot.enabled", False):
         try:
             from src.iot.mqtt_client import MQTTClient
-            from src.iot.server import run_server, set_mqtt_client, collect_sensor_data
+            from src.iot.server import run_server, set_mqtt_client, set_camera, collect_sensor_data
 
             # 启动 MQTT 客户端
             mqtt_config = config.get("iot.mqtt", {})
@@ -99,6 +102,9 @@ def main():
 
             # 注入到 FastAPI
             set_mqtt_client(mqtt_client)
+
+            # 注入摄像头引用（供 MJPEG 视频流使用）
+            set_camera(camera)
 
             # 启动 FastAPI 服务（独立线程）
             server_config = config.get("iot.server", {})
@@ -134,8 +140,6 @@ def main():
     camera.start()
 
     # 信号处理
-    running = True
-
     def signal_handler(sig, frame):
         nonlocal running
         logger.info("收到退出信号，正在停止...")
@@ -158,7 +162,8 @@ def main():
         """检测线程：持续取帧 → 缩放 → 检测 → 更新缓存"""
         DETECT_WIDTH = 640
         PERSON_INTERVAL = 3       # 行人检测：每3帧检测一次
-        PLATE_INTERVAL = 9        # 车牌检测：每9帧检测一次（CPU密集）
+        PLATE_INTERVAL = 3        # 车牌检测：每3帧检测一次
+        PLATE_UPSAMPLE = 2.0      # 车牌检测前上采样倍数（640x360→1280x720）
         detect_scale = None
         frame_count = 0
 
@@ -210,7 +215,12 @@ def main():
                 futures[executor.submit(person_detector.detect, small_frame)] = "person"
 
             if plate_detector is not None and need_plate:
-                futures[executor.submit(plate_detector.detect, frame)] = "plate"
+                # 上采样提升车牌识别率（640x360 → 1280x720）
+                plate_frame = cv2.resize(
+                    frame, None, fx=PLATE_UPSAMPLE, fy=PLATE_UPSAMPLE,
+                    interpolation=cv2.INTER_LINEAR
+                )
+                futures[executor.submit(plate_detector.detect, plate_frame)] = "plate"
 
             # 收集并行检测结果
             new_persons = None
@@ -228,9 +238,10 @@ def main():
                         new_persons = result
 
                     elif name == "plate":
-                        # 坐标从检测帧还原到原图
+                        # 坐标从上采样帧还原到原图（先除以上采样倍数，再除以detect_scale）
+                        plate_scale = detect_scale * PLATE_UPSAMPLE
                         for r in result:
-                            r["bbox"] = [int(v / detect_scale) for v in r["bbox"]]
+                            r["bbox"] = [int(v / plate_scale) for v in r["bbox"]]
                         new_plates = result
 
                 except Exception as e:

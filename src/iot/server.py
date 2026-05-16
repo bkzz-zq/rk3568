@@ -130,6 +130,10 @@ security = HTTPBearer(auto_error=False)
 _mqtt_client = None
 # 全局 AI 检测结果引用
 _ai_results = {"persons": None, "plates": None}
+# 全局摄像头引用（由 main.py 注入，用于视频流）
+_camera = None
+# 全局检测缩放比例
+_detect_scale = 1.0
 
 
 def set_mqtt_client(client):
@@ -142,6 +146,13 @@ def set_ai_results(persons, plates):
     """更新 AI 检测结果"""
     global _ai_results
     _ai_results = {"persons": persons, "plates": plates}
+
+
+def set_camera(camera, detect_scale=1.0):
+    """注入摄像头引用（用于 MJPEG 视频流）"""
+    global _camera, _detect_scale
+    _camera = camera
+    _detect_scale = detect_scale
 
 
 def _get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -399,6 +410,86 @@ async def get_ai_detection(user: dict = Depends(_get_current_user)):
     return _ai_results
 
 
+# ── MJPEG 视频流（App 端显示）─────────────────────────
+
+@app.get("/video/stream")
+def video_stream():
+    """MJPEG 实时视频流（带 AI 检测框叠加）
+
+    App 端用 WebView 或 ImageView 加载此 URL 即可显示视频。
+    """
+    import cv2
+    from starlette.responses import StreamingResponse
+
+    if not _camera:
+        raise HTTPException(status_code=503, detail="摄像头未就绪")
+
+    def generate():
+        """同步生成 MJPEG 帧（最高帧率）"""
+        while True:
+            frame = _camera.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            # 直接在帧上画检测框（不 copy）
+            results = _ai_results
+            if results.get("persons"):
+                for p in results["persons"]:
+                    bbox = p.get("bbox", [])
+                    if len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(frame, f"person {p.get('confidence',0):.0%}",
+                                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5, (0, 255, 0), 1)
+
+            if results.get("plates"):
+                for p in results["plates"]:
+                    bbox = p.get("bbox", [])
+                    if len(bbox) == 4:
+                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        label = p.get("plate", "plate")
+                        cv2.putText(frame, label,
+                                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.5, (0, 0, 255), 1)
+
+            # 编码 JPEG（640x360 已经很小，不额外缩放）
+            ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            if not ret:
+                continue
+
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" +
+                   jpeg.tobytes() + b"\r\n")
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/video/snapshot")
+async def video_snapshot():
+    """获取当前帧快照（JPEG 图片）"""
+    if not _camera:
+        raise HTTPException(status_code=503, detail="摄像头未就绪")
+
+    import cv2
+    from starlette.responses import Response
+
+    frame = _camera.get_frame()
+    if frame is None:
+        raise HTTPException(status_code=503, detail="无法获取视频帧")
+
+    ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ret:
+        raise HTTPException(status_code=500, detail="图像编码失败")
+
+    return Response(content=jpeg.tobytes(), media_type="image/jpeg")
+
+
 # ── 数据采集定时任务 ──────────────────────────────────
 
 def collect_sensor_data():
@@ -436,4 +527,4 @@ def run_server(host: str = "0.0.0.0", port: int = 8000):
     import uvicorn
     _init_db()
     logger.info(f"智能家居服务器启动: http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="warning", log_config=None)
