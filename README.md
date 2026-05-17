@@ -177,6 +177,7 @@ cp deploy/rk3568.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable rk3568
 systemctl start rk3568
+systemctl status frpc
 ```
 
 ### 5. PC 端开发调试
