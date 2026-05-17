@@ -1,0 +1,33 @@
+# FRP 客户端配置（运行在 RK3568 上）
+# 使用方法: ./frpc -c frpc.toml
+# 请将 <你的云服务器IP> 改为实际 IP
+
+serverAddr = "<你的云服务器IP>"
+serverPort = 7000
+
+# 认证（必须与服务端一致）
+auth.method = "token"
+auth.token = "rk3568_smart_home_token"
+
+# 日志
+log.to = "/var/log/frpc.log"
+log.level = "info"
+log.maxDays = 7
+
+# ── 代理规则 ──────────────────────────────────
+
+# API 服务 + 视频流（HTTP 端口 8000）
+[[proxies]]
+name = "rk3568-api"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8000
+remotePort = 8000
+
+# WebSocket 推送（端口 8765）
+[[proxies]]
+name = "rk3568-ws"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8765
+remotePort = 8765

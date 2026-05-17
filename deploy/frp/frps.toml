@@ -1,0 +1,19 @@
+# FRP 服务端配置（运行在云服务器上）
+# 使用方法: ./frps -c frps.toml
+
+bindPort = 7000
+
+# Web 管理面板（可选）
+webServer.addr = "0.0.0.0"
+webServer.port = 7500
+webServer.user = "admin"
+webServer.password = "admin123"
+
+# 认证
+auth.method = "token"
+auth.token = "rk3568_smart_home_token"
+
+# 日志
+log.to = "/var/log/frps.log"
+log.level = "info"
+log.maxDays = 7

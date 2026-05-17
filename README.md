@@ -219,6 +219,9 @@ journalctl -u rk3568 -n 50 --no-pager
 # 1. Windows 上传文件
 scp src/main.py root@192.168.0.100:/opt/rk3568/src/main.py
 
+# 重新加载 systemd 的服务配置文件
+systemctl daemon-reload
+
 # 2. 重启服务
 systemctl restart rk3568
 

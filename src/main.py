@@ -104,7 +104,9 @@ def main():
             set_mqtt_client(mqtt_client)
 
             # 注入摄像头引用（供 MJPEG 视频流使用）
-            set_camera(camera)
+            # detect_scale: 将 1920x1080 坐标缩放到当前帧分辨率（0.33）
+            detect_scale = getattr(camera, 'output_scale', 1.0)
+            set_camera(camera, detect_scale)
 
             # 启动 FastAPI 服务（独立线程）
             server_config = config.get("iot.server", {})

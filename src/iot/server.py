@@ -424,6 +424,35 @@ def video_stream():
     if not _camera:
         raise HTTPException(status_code=503, detail="摄像头未就绪")
 
+    # PIL 中文字体渲染（OpenCV putText 不支持中文）
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    # 尝试加载中文字体（按优先级）
+    _font = None
+    for font_path in [
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]:
+        if os.path.exists(font_path):
+            try:
+                _font = ImageFont.truetype(font_path, 14)
+                logger.info(f"视频流字体: {font_path}")
+                break
+            except Exception:
+                continue
+    if _font is None:
+        _font = ImageFont.load_default()
+
+    def _put_chinese_text(img, text, pos, color=(0, 0, 255)):
+        """在 OpenCV 图像上绘制中文文字"""
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(img_pil)
+        draw.text(pos, text, font=_font, fill=color[::-1])  # BGR→RGB
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
     def generate():
         """同步生成 MJPEG 帧（最高帧率）"""
         while True:
@@ -432,31 +461,172 @@ def video_stream():
                 time.sleep(0.01)
                 continue
 
-            # 直接在帧上画检测框（不 copy）
+            # AI 检测框坐标是 1920x1080 原始分辨率，需缩放到当前帧
+            scale = _detect_scale
             results = _ai_results
+            has_text = False
+            texts = []  # [(text, pos, color), ...]
+
+            # 先画矩形框（OpenCV）
             if results.get("persons"):
                 for p in results["persons"]:
                     bbox = p.get("bbox", [])
                     if len(bbox) == 4:
-                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        x1 = int(bbox[0] * scale)
+                        y1 = int(bbox[1] * scale)
+                        x2 = int(bbox[2] * scale)
+                        y2 = int(bbox[3] * scale)
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, f"person {p.get('confidence',0):.0%}",
-                                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5, (0, 255, 0), 1)
+                        texts.append((f"person {p.get('confidence',0):.0%}",
+                                     (x1, max(y1 - 18, 2)), (0, 255, 0)))
 
             if results.get("plates"):
                 for p in results["plates"]:
                     bbox = p.get("bbox", [])
                     if len(bbox) == 4:
-                        x1, y1, x2, y2 = [int(v) for v in bbox]
+                        x1 = int(bbox[0] * scale)
+                        y1 = int(bbox[1] * scale)
+                        x2 = int(bbox[2] * scale)
+                        y2 = int(bbox[3] * scale)
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                        label = p.get("plate", "plate")
-                        cv2.putText(frame, label,
-                                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5, (0, 0, 255), 1)
+                        plate_num = p.get("plate_number", "未知车牌")
+                        plate_color = p.get("plate_color", "")
+                        label = f"{plate_num}({plate_color})" if plate_color else plate_num
+                        texts.append((label, (x1, max(y1 - 18, 2)), (0, 0, 255)))
+
+            # 一次性用 PIL 绘制所有文字（避免多次 BGR↔RGB 转换）
+            if texts:
+                img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(img_pil)
+                for text, pos, color in texts:
+                    draw.text(pos, text, font=_font, fill=color[::-1])
+                frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
             # 编码 JPEG（640x360 已经很小，不额外缩放）
             ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            if not ret:
+                continue
+
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" +
+                   jpeg.tobytes() + b"\r\n")
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.get("/video/stream_low")
+def video_stream_low(
+    quality: int = 30,
+    fps: int = 15,
+    scale: float = 0.75,
+):
+    """MJPEG 低带宽视频流（适合外网穿透，3Mbps 以下）
+
+    参数:
+      quality: JPEG 质量 (10-50, 默认 30)
+      fps:     目标帧率 (1-25, 默认 15)
+      scale:   缩放比例 (0.25-1.0, 默认 0.75)
+
+    示例:
+      /video/stream_low                    → 480x270, 质量30%, 15fps
+      /video/stream_low?quality=20&fps=10  → 480x270, 质量20%, 10fps
+      /video/stream_low?scale=0.5&fps=10   → 320x180, 质量30%, 10fps
+    """
+    import cv2
+    from starlette.responses import StreamingResponse
+
+    if not _camera:
+        raise HTTPException(status_code=503, detail="摄像头未就绪")
+
+    from PIL import Image, ImageDraw, ImageFont
+    import numpy as np
+
+    # 加载中文字体
+    _font = None
+    for font_path in [
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]:
+        if os.path.exists(font_path):
+            try:
+                _font = ImageFont.truetype(font_path, 12)
+                break
+            except Exception:
+                continue
+    if _font is None:
+        _font = ImageFont.load_default()
+
+    # 参数范围限制
+    quality = max(10, min(50, quality))
+    target_fps = max(1, min(25, fps))
+    frame_scale = max(0.25, min(1.0, scale))
+    frame_interval = 1.0 / target_fps
+
+    def generate():
+        """低带宽 MJPEG 生成器"""
+        last_time = time.time()
+        while True:
+            now = time.time()
+            elapsed = now - last_time
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)
+            last_time = time.time()
+
+            frame = _camera.get_frame()
+            if frame is None:
+                time.sleep(0.01)
+                continue
+
+            # 缩小分辨率（进一步降低带宽）
+            if frame_scale < 1.0:
+                frame = cv2.resize(frame, None, fx=frame_scale, fy=frame_scale,
+                                   interpolation=cv2.INTER_LINEAR)
+
+            # 缩放检测框坐标
+            scale = _detect_scale * frame_scale
+            results = _ai_results
+            texts = []
+
+            if results.get("persons"):
+                for p in results["persons"]:
+                    bbox = p.get("bbox", [])
+                    if len(bbox) == 4:
+                        x1 = int(bbox[0] * scale)
+                        y1 = int(bbox[1] * scale)
+                        x2 = int(bbox[2] * scale)
+                        y2 = int(bbox[3] * scale)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                        texts.append((f"person {p.get('confidence',0):.0%}",
+                                     (x1, max(y1 - 14, 2)), (0, 255, 0)))
+
+            if results.get("plates"):
+                for p in results["plates"]:
+                    bbox = p.get("bbox", [])
+                    if len(bbox) == 4:
+                        x1 = int(bbox[0] * scale)
+                        y1 = int(bbox[1] * scale)
+                        x2 = int(bbox[2] * scale)
+                        y2 = int(bbox[3] * scale)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 1)
+                        plate_num = p.get("plate_number", "未知车牌")
+                        plate_color = p.get("plate_color", "")
+                        label = f"{plate_num}({plate_color})" if plate_color else plate_num
+                        texts.append((label, (x1, max(y1 - 14, 2)), (0, 0, 255)))
+
+            if texts:
+                img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(img_pil)
+                for text, pos, color in texts:
+                    draw.text(pos, text, font=_font, fill=color[::-1])
+                frame = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+
+            # 低质量 JPEG 编码
+            ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if not ret:
                 continue
 

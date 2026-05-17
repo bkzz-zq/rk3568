@@ -11,6 +11,9 @@ WorkingDirectory=/opt/rk3568
 ExecStart=/bin/bash -c 'source /opt/rk3568/.venv/bin/activate && python3 /opt/rk3568/src/main.py'
 ExecStop=/bin/kill -SIGTERM $MAINPID
 
+# 停止超时（秒）
+TimeoutStopSec=30
+
 # 自动重启
 Restart=on-failure
 RestartSec=10
